@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Kris Risner MCP Abilities
  * Description: Exposes site content, SEO data, structure, and Bricks Builder content to AI via MCP.
- * Version: 2.6
+ * Version: 3.0
  * Author: Kris Risner
  */
 
@@ -374,7 +374,7 @@ function kr_register_abilities() {
         array(
             'category'            => 'krisrisner',
             'label'               => 'Get Site Content',
-            'description'         => 'Returns published pages and posts with full content, SEO meta (Rank Math), URL, date, and word count.',
+            'description'         => 'Returns published pages and posts with full content, SEO meta (auto-detects Rank Math, Yoast SEO, SEOPress, or All in One SEO), URL, date, and word count.',
             'input_schema'        => array(
                 'type'       => 'object',
                 'properties' => array(
@@ -537,7 +537,7 @@ function kr_register_abilities() {
         array(
             'category'            => 'krisrisner',
             'label'               => 'Update SEO Meta',
-            'description'         => 'Updates Rank Math SEO meta: title, description, focus keyword, robots, canonical, schema type.',
+            'description'         => 'Updates SEO meta (auto-detects Rank Math, Yoast SEO, SEOPress, or All in One SEO): title, description, focus keyword, robots, canonical, schema type.',
             'input_schema'        => array(
                 'type'       => 'object',
                 'properties' => array(
@@ -691,6 +691,28 @@ function kr_register_abilities() {
             'meta'                => array( 'mcp' => array( 'public' => true ) ),
         )
     );
+
+    // 13. SEO Provider Info
+    wp_register_ability(
+        'krisrisner/seo-provider',
+        array(
+            'category'            => 'krisrisner',
+            'label'               => 'SEO Provider',
+            'description'         => 'Returns which SEO plugin is currently active on the site (Rank Math, Yoast SEO, SEOPress, All in One SEO, or none). Useful for checking which fields the SEO read/write abilities will operate on before invoking them.',
+            'input_schema'        => array( 'type' => 'object', 'properties' => array() ),
+            'output_schema'       => array(
+                'type'       => 'object',
+                'properties' => array(
+                    'provider'      => array( 'type' => 'string' ),
+                    'provider_name' => array( 'type' => 'string' ),
+                    'detected'      => array( 'type' => 'boolean' ),
+                ),
+            ),
+            'permission_callback' => '__return_true',
+            'execute_callback'    => 'kr_seo_provider_execute',
+            'meta'                => array( 'mcp' => array( 'public' => true ) ),
+        )
+    );
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -778,6 +800,292 @@ function kr_save_bricks_elements( $post_id, $elements, $original_meta = null ) {
     return isset( $backup_key ) ? $backup_key : '';
 }
 
+// ─── SEO Provider Abstraction ───────────────────────────────────────────────
+//
+// Auto-detects which SEO plugin is active and routes reads/writes through a
+// matching adapter. Supported providers: Rank Math, Yoast SEO, SEOPress, AIOSEO.
+// All adapters return/accept the same normalized structure:
+//   array(
+//     'seo_title'       => string,
+//     'seo_description' => string,
+//     'focus_keyword'   => string,
+//     'robots'          => array<string>  (e.g. ['noindex', 'nofollow', 'noarchive']),
+//     'canonical'       => string,
+//     'schema_type'     => string,
+//     'seo_score'       => string,
+//   )
+
+function kr_get_seo_provider() {
+    static $cached = null;
+    if ( null !== $cached ) return $cached;
+
+    if ( class_exists( 'RankMath' ) || defined( 'RANK_MATH_VERSION' ) ) {
+        $cached = 'rankmath';
+    } elseif ( defined( 'WPSEO_VERSION' ) || class_exists( 'WPSEO_Options' ) ) {
+        $cached = 'yoast';
+    } elseif ( defined( 'SEOPRESS_VERSION' ) ) {
+        $cached = 'seopress';
+    } elseif ( defined( 'AIOSEO_VERSION' ) || function_exists( 'aioseo' ) ) {
+        $cached = 'aioseo';
+    } else {
+        $cached = 'none';
+    }
+    return $cached;
+}
+
+function kr_empty_seo_meta() {
+    return array(
+        'seo_title'       => '',
+        'seo_description' => '',
+        'focus_keyword'   => '',
+        'robots'          => array(),
+        'canonical'       => '',
+        'schema_type'     => '',
+        'seo_score'       => '',
+    );
+}
+
+function kr_get_seo_meta( $post_id ) {
+    switch ( kr_get_seo_provider() ) {
+        case 'rankmath': return kr_get_rankmath_meta( $post_id );
+        case 'yoast':    return kr_get_yoast_meta( $post_id );
+        case 'seopress': return kr_get_seopress_meta( $post_id );
+        case 'aioseo':   return kr_get_aioseo_meta( $post_id );
+        default:         return kr_empty_seo_meta();
+    }
+}
+
+function kr_update_seo_meta_via_provider( $post_id, $data ) {
+    switch ( kr_get_seo_provider() ) {
+        case 'rankmath': return kr_update_rankmath_meta( $post_id, $data );
+        case 'yoast':    return kr_update_yoast_meta( $post_id, $data );
+        case 'seopress': return kr_update_seopress_meta( $post_id, $data );
+        case 'aioseo':   return kr_update_aioseo_meta( $post_id, $data );
+        default:         return array();
+    }
+}
+
+// ── Rank Math ───────────────────────────────────────────────────────────────
+
+function kr_get_rankmath_meta( $post_id ) {
+    $robots = get_post_meta( $post_id, 'rank_math_robots', true );
+    return array(
+        'seo_title'       => (string) get_post_meta( $post_id, 'rank_math_title', true ),
+        'seo_description' => (string) get_post_meta( $post_id, 'rank_math_description', true ),
+        'focus_keyword'   => (string) get_post_meta( $post_id, 'rank_math_focus_keyword', true ),
+        'robots'          => is_array( $robots ) ? $robots : array(),
+        'canonical'       => (string) get_post_meta( $post_id, 'rank_math_canonical_url', true ),
+        'schema_type'     => (string) get_post_meta( $post_id, 'rank_math_rich_snippet', true ),
+        'seo_score'       => (string) get_post_meta( $post_id, 'rank_math_seo_score', true ),
+    );
+}
+
+function kr_update_rankmath_meta( $post_id, $data ) {
+    $map = array(
+        'seo_title'       => 'rank_math_title',
+        'seo_description' => 'rank_math_description',
+        'focus_keyword'   => 'rank_math_focus_keyword',
+        'canonical'       => 'rank_math_canonical_url',
+        'schema_type'     => 'rank_math_rich_snippet',
+    );
+    $updated = array();
+    foreach ( $map as $k => $mk ) {
+        if ( isset( $data[ $k ] ) && '' !== $data[ $k ] ) {
+            update_post_meta( $post_id, $mk, sanitize_text_field( $data[ $k ] ) );
+            $updated[] = $k;
+        }
+    }
+    if ( isset( $data['robots'] ) && is_array( $data['robots'] ) ) {
+        update_post_meta( $post_id, 'rank_math_robots', array_map( 'sanitize_text_field', $data['robots'] ) );
+        $updated[] = 'robots';
+    }
+    return $updated;
+}
+
+// ── Yoast SEO ───────────────────────────────────────────────────────────────
+
+function kr_get_yoast_meta( $post_id ) {
+    $robots = array();
+    if ( '1' === (string) get_post_meta( $post_id, '_yoast_wpseo_meta-robots-noindex', true ) )  $robots[] = 'noindex';
+    if ( '1' === (string) get_post_meta( $post_id, '_yoast_wpseo_meta-robots-nofollow', true ) ) $robots[] = 'nofollow';
+    $adv = (string) get_post_meta( $post_id, '_yoast_wpseo_meta-robots-adv', true );
+    if ( $adv && 'none' !== $adv ) {
+        foreach ( explode( ',', $adv ) as $a ) {
+            $a = trim( $a );
+            if ( $a ) $robots[] = $a;
+        }
+    }
+    return array(
+        'seo_title'       => (string) get_post_meta( $post_id, '_yoast_wpseo_title', true ),
+        'seo_description' => (string) get_post_meta( $post_id, '_yoast_wpseo_metadesc', true ),
+        'focus_keyword'   => (string) get_post_meta( $post_id, '_yoast_wpseo_focuskw', true ),
+        'robots'          => $robots,
+        'canonical'       => (string) get_post_meta( $post_id, '_yoast_wpseo_canonical', true ),
+        'schema_type'     => (string) get_post_meta( $post_id, '_yoast_wpseo_schema_page_type', true ),
+        'seo_score'       => (string) get_post_meta( $post_id, '_yoast_wpseo_linkdex', true ),
+    );
+}
+
+function kr_update_yoast_meta( $post_id, $data ) {
+    $map = array(
+        'seo_title'       => '_yoast_wpseo_title',
+        'seo_description' => '_yoast_wpseo_metadesc',
+        'focus_keyword'   => '_yoast_wpseo_focuskw',
+        'canonical'       => '_yoast_wpseo_canonical',
+    );
+    $updated = array();
+    foreach ( $map as $k => $mk ) {
+        if ( isset( $data[ $k ] ) && '' !== $data[ $k ] ) {
+            update_post_meta( $post_id, $mk, sanitize_text_field( $data[ $k ] ) );
+            $updated[] = $k;
+        }
+    }
+    if ( isset( $data['robots'] ) && is_array( $data['robots'] ) ) {
+        $robots = array_map( 'sanitize_text_field', $data['robots'] );
+        // Yoast splits robots across three meta keys: noindex (1=noindex, 2=index),
+        // nofollow (1=nofollow, 0=follow), and adv (comma-separated extras like noimageindex).
+        update_post_meta( $post_id, '_yoast_wpseo_meta-robots-noindex',  in_array( 'noindex', $robots, true ) ? '1' : '2' );
+        update_post_meta( $post_id, '_yoast_wpseo_meta-robots-nofollow', in_array( 'nofollow', $robots, true ) ? '1' : '0' );
+        $adv = array_values( array_diff( $robots, array( 'noindex', 'nofollow' ) ) );
+        update_post_meta( $post_id, '_yoast_wpseo_meta-robots-adv', $adv ? implode( ',', $adv ) : 'none' );
+        $updated[] = 'robots';
+    }
+    if ( isset( $data['schema_type'] ) && '' !== $data['schema_type'] ) {
+        update_post_meta( $post_id, '_yoast_wpseo_schema_page_type', sanitize_text_field( $data['schema_type'] ) );
+        $updated[] = 'schema_type';
+    }
+    return $updated;
+}
+
+// ── SEOPress ────────────────────────────────────────────────────────────────
+
+function kr_get_seopress_meta( $post_id ) {
+    $robots = array();
+    if ( 'yes' === (string) get_post_meta( $post_id, '_seopress_robots_index', true ) )      $robots[] = 'noindex';
+    if ( 'yes' === (string) get_post_meta( $post_id, '_seopress_robots_follow', true ) )     $robots[] = 'nofollow';
+    if ( 'yes' === (string) get_post_meta( $post_id, '_seopress_robots_archive', true ) )    $robots[] = 'noarchive';
+    if ( 'yes' === (string) get_post_meta( $post_id, '_seopress_robots_snippet', true ) )    $robots[] = 'nosnippet';
+    if ( 'yes' === (string) get_post_meta( $post_id, '_seopress_robots_imageindex', true ) ) $robots[] = 'noimageindex';
+    return array(
+        'seo_title'       => (string) get_post_meta( $post_id, '_seopress_titles_title', true ),
+        'seo_description' => (string) get_post_meta( $post_id, '_seopress_titles_desc', true ),
+        'focus_keyword'   => (string) get_post_meta( $post_id, '_seopress_analysis_target_kw', true ),
+        'robots'          => $robots,
+        'canonical'       => (string) get_post_meta( $post_id, '_seopress_robots_canonical', true ),
+        'schema_type'     => (string) get_post_meta( $post_id, '_seopress_pro_schemas_manual_type', true ),
+        'seo_score'       => '',
+    );
+}
+
+function kr_update_seopress_meta( $post_id, $data ) {
+    $map = array(
+        'seo_title'       => '_seopress_titles_title',
+        'seo_description' => '_seopress_titles_desc',
+        'focus_keyword'   => '_seopress_analysis_target_kw',
+        'canonical'       => '_seopress_robots_canonical',
+        'schema_type'     => '_seopress_pro_schemas_manual_type',
+    );
+    $updated = array();
+    foreach ( $map as $k => $mk ) {
+        if ( isset( $data[ $k ] ) && '' !== $data[ $k ] ) {
+            update_post_meta( $post_id, $mk, sanitize_text_field( $data[ $k ] ) );
+            $updated[] = $k;
+        }
+    }
+    if ( isset( $data['robots'] ) && is_array( $data['robots'] ) ) {
+        $robots = array_map( 'sanitize_text_field', $data['robots'] );
+        update_post_meta( $post_id, '_seopress_robots_index',      in_array( 'noindex', $robots, true ) ? 'yes' : '' );
+        update_post_meta( $post_id, '_seopress_robots_follow',     in_array( 'nofollow', $robots, true ) ? 'yes' : '' );
+        update_post_meta( $post_id, '_seopress_robots_archive',    in_array( 'noarchive', $robots, true ) ? 'yes' : '' );
+        update_post_meta( $post_id, '_seopress_robots_snippet',    in_array( 'nosnippet', $robots, true ) ? 'yes' : '' );
+        update_post_meta( $post_id, '_seopress_robots_imageindex', in_array( 'noimageindex', $robots, true ) ? 'yes' : '' );
+        $updated[] = 'robots';
+    }
+    return $updated;
+}
+
+// ── All in One SEO (AIOSEO v4+) ─────────────────────────────────────────────
+// AIOSEO v4 stores data in a custom table (wp_aioseo_posts), not postmeta.
+// We use their Post model when available so saves go through their normal
+// validation and cache-invalidation. Falls back to empty if model is missing.
+
+function kr_get_aioseo_meta( $post_id ) {
+    if ( ! class_exists( 'AIOSEO\\Plugin\\Common\\Models\\Post' ) ) {
+        return kr_empty_seo_meta();
+    }
+    $aio = \AIOSEO\Plugin\Common\Models\Post::getPost( $post_id );
+    if ( ! $aio || ! $aio->exists() ) {
+        return kr_empty_seo_meta();
+    }
+    $robots = array();
+    if ( ! $aio->robots_default ) {
+        if ( $aio->robots_noindex )      $robots[] = 'noindex';
+        if ( $aio->robots_nofollow )     $robots[] = 'nofollow';
+        if ( $aio->robots_noarchive )    $robots[] = 'noarchive';
+        if ( $aio->robots_nosnippet )    $robots[] = 'nosnippet';
+        if ( $aio->robots_noimageindex ) $robots[] = 'noimageindex';
+    }
+    $focus = '';
+    $kp = is_string( $aio->keyphrases ) ? json_decode( $aio->keyphrases, true ) : (array) $aio->keyphrases;
+    if ( is_array( $kp ) && ! empty( $kp['focus']['keyphrase'] ) ) {
+        $focus = $kp['focus']['keyphrase'];
+    }
+    return array(
+        'seo_title'       => (string) $aio->title,
+        'seo_description' => (string) $aio->description,
+        'focus_keyword'   => (string) $focus,
+        'robots'          => $robots,
+        'canonical'       => (string) $aio->canonical_url,
+        'schema_type'     => '', // AIOSEO stores schema as a complex blob; not exposed as a single type
+        'seo_score'       => isset( $aio->seo_score ) ? (string) $aio->seo_score : '',
+    );
+}
+
+function kr_update_aioseo_meta( $post_id, $data ) {
+    if ( ! class_exists( 'AIOSEO\\Plugin\\Common\\Models\\Post' ) ) {
+        return array();
+    }
+    $aio = \AIOSEO\Plugin\Common\Models\Post::getPost( $post_id );
+    if ( ! $aio ) return array();
+
+    $updated = array();
+    if ( isset( $data['seo_title'] ) && '' !== $data['seo_title'] ) {
+        $aio->title = sanitize_text_field( $data['seo_title'] );
+        $updated[] = 'seo_title';
+    }
+    if ( isset( $data['seo_description'] ) && '' !== $data['seo_description'] ) {
+        $aio->description = sanitize_text_field( $data['seo_description'] );
+        $updated[] = 'seo_description';
+    }
+    if ( isset( $data['focus_keyword'] ) && '' !== $data['focus_keyword'] ) {
+        $kp = is_string( $aio->keyphrases ) ? json_decode( $aio->keyphrases, true ) : (array) $aio->keyphrases;
+        if ( ! is_array( $kp ) ) $kp = array();
+        $kp['focus'] = array(
+            'keyphrase' => sanitize_text_field( $data['focus_keyword'] ),
+            'score'     => 0,
+            'analysis'  => array(),
+        );
+        $aio->keyphrases = wp_json_encode( $kp );
+        $updated[] = 'focus_keyword';
+    }
+    if ( isset( $data['canonical'] ) && '' !== $data['canonical'] ) {
+        $aio->canonical_url = esc_url_raw( $data['canonical'] );
+        $updated[] = 'canonical';
+    }
+    if ( isset( $data['robots'] ) && is_array( $data['robots'] ) ) {
+        $robots = array_map( 'sanitize_text_field', $data['robots'] );
+        $aio->robots_default      = empty( $robots ) ? 1 : 0;
+        $aio->robots_noindex      = in_array( 'noindex', $robots, true ) ? 1 : 0;
+        $aio->robots_nofollow     = in_array( 'nofollow', $robots, true ) ? 1 : 0;
+        $aio->robots_noarchive    = in_array( 'noarchive', $robots, true ) ? 1 : 0;
+        $aio->robots_nosnippet    = in_array( 'nosnippet', $robots, true ) ? 1 : 0;
+        $aio->robots_noimageindex = in_array( 'noimageindex', $robots, true ) ? 1 : 0;
+        $updated[] = 'robots';
+    }
+    if ( $updated ) $aio->save();
+    return $updated;
+}
+
 // ─── Callbacks ──────────────────────────────────────────────────────────────
 
 function kr_get_content_execute( $input ) {
@@ -795,17 +1103,18 @@ function kr_get_content_execute( $input ) {
     $items = array();
     foreach ( $query->posts as $post ) {
         $content = wp_strip_all_tags( $post->post_content );
+        $seo     = kr_get_seo_meta( $post->ID );
         $items[] = array(
             'id' => $post->ID, 'title' => $post->post_title, 'url' => get_permalink( $post->ID ),
             'post_type' => $post->post_type, 'date' => get_the_date( 'Y-m-d', $post->ID ),
             'modified' => get_the_modified_date( 'Y-m-d', $post->ID ), 'word_count' => str_word_count( $content ),
             'content' => $content,
             'excerpt' => has_excerpt( $post->ID ) ? get_the_excerpt( $post ) : wp_trim_words( $post->post_content, 40 ),
-            'seo_title' => get_post_meta( $post->ID, 'rank_math_title', true ),
-            'seo_description' => get_post_meta( $post->ID, 'rank_math_description', true ),
-            'focus_keyword' => get_post_meta( $post->ID, 'rank_math_focus_keyword', true ),
-            'robots' => get_post_meta( $post->ID, 'rank_math_robots', true ),
-            'canonical' => get_post_meta( $post->ID, 'rank_math_canonical_url', true ),
+            'seo_title'       => $seo['seo_title'],
+            'seo_description' => $seo['seo_description'],
+            'focus_keyword'   => $seo['focus_keyword'],
+            'robots'          => $seo['robots'],
+            'canonical'       => $seo['canonical'],
         );
     }
     return array( 'items' => $items, 'total' => $query->found_posts );
@@ -823,9 +1132,10 @@ function kr_seo_audit_execute( $input ) {
     $items = array();
     foreach ( $query->posts as $post ) {
         $content   = wp_strip_all_tags( $post->post_content );
-        $seo_title = get_post_meta( $post->ID, 'rank_math_title', true );
-        $seo_desc  = get_post_meta( $post->ID, 'rank_math_description', true );
-        $focus_kw  = get_post_meta( $post->ID, 'rank_math_focus_keyword', true );
+        $seo       = kr_get_seo_meta( $post->ID );
+        $seo_title = $seo['seo_title'];
+        $seo_desc  = $seo['seo_description'];
+        $focus_kw  = $seo['focus_keyword'];
 
         $issues = array();
         if ( empty( $seo_title ) )                                $issues[] = 'missing_seo_title';
@@ -838,14 +1148,14 @@ function kr_seo_audit_execute( $input ) {
         $items[] = array(
             'id' => $post->ID, 'title' => $post->post_title, 'url' => get_permalink( $post->ID ),
             'post_type' => $post->post_type, 'word_count' => str_word_count( $content ),
-            'seo_title' => $seo_title, 'seo_title_len' => strlen( $seo_title ?: '' ),
-            'seo_description' => $seo_desc, 'seo_desc_len' => strlen( $seo_desc ?: '' ),
+            'seo_title' => $seo_title, 'seo_title_len' => strlen( $seo_title ),
+            'seo_description' => $seo_desc, 'seo_desc_len' => strlen( $seo_desc ),
             'focus_keyword' => $focus_kw,
-            'robots' => get_post_meta( $post->ID, 'rank_math_robots', true ),
-            'canonical' => get_post_meta( $post->ID, 'rank_math_canonical_url', true ),
-            'schema_type' => get_post_meta( $post->ID, 'rank_math_rich_snippet', true ),
-            'seo_score' => get_post_meta( $post->ID, 'rank_math_seo_score', true ),
-            'issues' => $issues,
+            'robots'      => $seo['robots'],
+            'canonical'   => $seo['canonical'],
+            'schema_type' => $seo['schema_type'],
+            'seo_score'   => $seo['seo_score'],
+            'issues'      => $issues,
         );
     }
     return array( 'items' => $items, 'total' => $query->found_posts );
@@ -961,16 +1271,30 @@ function kr_update_seo_meta_execute( $input ) {
     $post_id = isset( $input['post_id'] ) ? intval( $input['post_id'] ) : 0;
     if ( ! $post_id || ! get_post( $post_id ) ) return array( 'success' => false, 'error' => 'Invalid post ID.' );
 
-    $map = array( 'focus_keyword' => 'rank_math_focus_keyword', 'seo_title' => 'rank_math_title',
-        'seo_description' => 'rank_math_description', 'canonical' => 'rank_math_canonical_url', 'schema_type' => 'rank_math_rich_snippet' );
-    $updated = array();
-    foreach ( $map as $k => $mk ) {
-        if ( ! empty( $input[ $k ] ) ) { update_post_meta( $post_id, $mk, sanitize_text_field( $input[ $k ] ) ); $updated[] = $k; }
+    $provider = kr_get_seo_provider();
+    if ( 'none' === $provider ) {
+        return array( 'success' => false, 'error' => 'No supported SEO plugin detected. Install Rank Math, Yoast SEO, SEOPress, or All in One SEO.' );
     }
-    if ( ! empty( $input['robots'] ) && is_array( $input['robots'] ) ) {
-        update_post_meta( $post_id, 'rank_math_robots', array_map( 'sanitize_text_field', $input['robots'] ) ); $updated[] = 'robots';
+
+    $data = array(
+        'seo_title'       => isset( $input['seo_title'] ) ? $input['seo_title'] : '',
+        'seo_description' => isset( $input['seo_description'] ) ? $input['seo_description'] : '',
+        'focus_keyword'   => isset( $input['focus_keyword'] ) ? $input['focus_keyword'] : '',
+        'canonical'       => isset( $input['canonical'] ) ? $input['canonical'] : '',
+        'schema_type'     => isset( $input['schema_type'] ) ? $input['schema_type'] : '',
+    );
+    if ( isset( $input['robots'] ) && is_array( $input['robots'] ) ) {
+        $data['robots'] = $input['robots'];
     }
-    return array( 'success' => true, 'post_id' => $post_id, 'updated' => $updated, 'message' => sprintf( 'Updated %d field(s) for post %d.', count( $updated ), $post_id ) );
+
+    $updated = kr_update_seo_meta_via_provider( $post_id, $data );
+    return array(
+        'success'  => true,
+        'post_id'  => $post_id,
+        'provider' => $provider,
+        'updated'  => $updated,
+        'message'  => sprintf( 'Updated %d field(s) for post %d via %s.', count( $updated ), $post_id, $provider ),
+    );
 }
 
 function kr_update_bricks_content_execute( $input ) {
@@ -1153,4 +1477,22 @@ function kr_update_image_alt_execute( $input ) {
 
     $success_count = count( array_filter( $results, fn( $r ) => $r['status'] === 'updated' ) );
     return array( 'success' => true, 'updated' => $success_count, 'items' => $results );
+}
+
+// ─── New Callback: SEO Provider Info ────────────────────────────────────────
+
+function kr_seo_provider_execute( $input ) {
+    $provider = kr_get_seo_provider();
+    $names = array(
+        'rankmath' => 'Rank Math',
+        'yoast'    => 'Yoast SEO',
+        'seopress' => 'SEOPress',
+        'aioseo'   => 'All in One SEO',
+        'none'     => 'None detected',
+    );
+    return array(
+        'provider'      => $provider,
+        'provider_name' => isset( $names[ $provider ] ) ? $names[ $provider ] : 'Unknown',
+        'detected'      => 'none' !== $provider,
+    );
 }
